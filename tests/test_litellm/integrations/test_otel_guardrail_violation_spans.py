@@ -98,10 +98,11 @@ def _slg_entry(
     provider="bedrock",
     start=1.0,
     end=2.0,
+    violation_categories=None,
 ):
     """Build a StandardLoggingGuardrailInformation entry the way
     ``add_standard_logging_guardrail_information_to_request_data`` does."""
-    return {
+    entry = {
         "guardrail_name": name,
         "guardrail_provider": provider,
         "guardrail_mode": mode,
@@ -111,6 +112,9 @@ def _slg_entry(
         "end_time": end,
         "duration": end - start,
     }
+    if violation_categories is not None:
+        entry["violation_categories"] = violation_categories
+    return entry
 
 
 def _kwargs_with_guardrail(
@@ -155,6 +159,19 @@ def _make_otel():
     otel = OpenTelemetry(tracer_provider=provider)
     otel.tracer = provider.get_tracer(__name__)
     return otel, provider, exporter
+
+
+def _run(coro):
+    """Run a coroutine on a fresh event loop and close it — prevents the
+    "unclosed event loop" / ResourceWarning that you get from
+    asyncio.new_event_loop().run_until_complete() with no cleanup."""
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def _attr(span, key):
@@ -215,8 +232,6 @@ class TestGuardrailSpanOnViolation(unittest.TestCase):
         ``request_data``. The hook currently only stamps attrs on the proxy
         span; it must also emit the guardrail span so the violation is
         visible in the trace."""
-        import asyncio
-
         otel, provider, exporter = _make_otel()
         parent_span = provider.get_tracer(__name__).start_span(PROXY_SPAN_NAME)
 
@@ -236,7 +251,7 @@ class TestGuardrailSpanOnViolation(unittest.TestCase):
             },
         }
 
-        asyncio.new_event_loop().run_until_complete(
+        _run(
             otel.async_post_call_failure_hook(
                 request_data=request_data,
                 original_exception=Exception("guardrail blocked"),
@@ -259,6 +274,78 @@ class TestGuardrailSpanOnViolation(unittest.TestCase):
         self.assertEqual(
             guardrail_spans[0].parent.span_id,
             parent_span.context.span_id,
+        )
+
+    def test_handle_failure_and_post_call_failure_hook_dedupe(self):
+        """When _handle_failure and async_post_call_failure_hook BOTH fire
+        for the same request (the production flow on a guardrail block),
+        exactly one guardrail span must be emitted. The dedupe relies on
+        request_data['metadata'] and kwargs['litellm_params']['metadata']
+        referencing the SAME dict so _emit_once sees its earlier marker."""
+        otel, provider, exporter = _make_otel()
+        parent_span = provider.get_tracer(__name__).start_span(PROXY_SPAN_NAME)
+
+        # Shared metadata dict — same identity, mirroring how
+        # update_environment_variables wires them in the proxy.
+        shared_metadata = {
+            "standard_logging_guardrail_information": [
+                _slg_entry(
+                    "guardrail_intervened",
+                    _bedrock_block_response(),
+                    violation_categories=["Fiduciary Advice"],
+                )
+            ],
+        }
+
+        kwargs = {
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "optional_params": {},
+            "litellm_params": {
+                "custom_llm_provider": "openai",
+                "metadata": shared_metadata,
+            },
+            "standard_logging_object": {
+                "id": "test-call-id",
+                "call_type": "completion",
+                "metadata": shared_metadata,
+                "hidden_params": {},
+                "guardrail_information": shared_metadata[
+                    "standard_logging_guardrail_information"
+                ],
+            },
+            "exception": Exception("guardrail blocked"),
+        }
+        request_data = {
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "metadata": shared_metadata,
+        }
+        user_api_key_dict = UserAPIKeyAuth(
+            api_key="sk-test",
+            parent_otel_span=parent_span,
+            request_route="/chat/completions",
+        )
+
+        start = datetime.now(timezone.utc)
+        end = start + timedelta(milliseconds=20)
+        otel._handle_failure(kwargs, response_obj=None, start_time=start, end_time=end)
+        _run(
+            otel.async_post_call_failure_hook(
+                request_data=request_data,
+                original_exception=Exception("guardrail blocked"),
+                user_api_key_dict=user_api_key_dict,
+            )
+        )
+
+        guardrail_spans = [
+            s for s in exporter.get_finished_spans() if s.name == GUARDRAIL_SPAN_NAME
+        ]
+        self.assertEqual(
+            len(guardrail_spans),
+            1,
+            "Dedupe must collapse the two emit calls into one span when the "
+            "metadata dict identity is shared between kwargs and request_data",
         )
 
 
@@ -303,42 +390,46 @@ class TestGuardrailSpanAttributesOnViolation(unittest.TestCase):
         span = self._emit_and_get_guardrail_span(entry)
         self.assertEqual(_attr(span, "guardrail_status"), "guardrail_failed_to_respond")
 
-    def test_violation_categories_extracted_from_bedrock_response(self):
-        """When a Bedrock guardrail blocks, the categories that triggered
-        the block (topic-policy topics with action=BLOCKED, content-policy
-        filters with action=BLOCKED, etc.) must be exposed as a span
-        attribute so dashboards can group by violation type."""
-        entry = _slg_entry("guardrail_intervened", _bedrock_block_response())
+    def test_violation_categories_surfaced_when_provider_populates_them(self):
+        """The provider hook (e.g. Bedrock) extracts violation categories
+        from the raw response BEFORE redaction and stamps them onto the
+        StandardLoggingGuardrailInformation entry. OTEL must surface that
+        list as a queryable span attribute so dashboards can group by
+        violation type without parsing the redacted guardrail_response."""
+        entry = _slg_entry(
+            "guardrail_intervened",
+            _bedrock_block_response(),
+            violation_categories=["Fiduciary Advice", "VIOLENCE", "PROFANITY"],
+        )
         span = self._emit_and_get_guardrail_span(entry)
 
         categories = _attr(span, "guardrail_violation_categories")
         self.assertIsNotNone(
             categories,
-            "guardrail_violation_categories must be set when the response "
-            "contains BLOCKED assessments",
+            "guardrail_violation_categories must be set when the entry "
+            "carries violation_categories",
         )
-        # Categories may serialise as a JSON string or an OTEL sequence;
-        # accept either as long as the salient values are present.
+        # Serialised as JSON to keep set_attribute typing simple.
         as_str = categories if isinstance(categories, str) else repr(list(categories))
         self.assertIn("Fiduciary Advice", as_str)
         self.assertIn("VIOLENCE", as_str)
         self.assertIn("PROFANITY", as_str)
 
-    def test_violation_action_extracted(self):
-        """The top-level Bedrock ``action`` ("GUARDRAIL_INTERVENED" /
-        "NONE") tells you at a glance whether the guardrail blocked
-        anything. Expose it as its own attribute."""
-        entry = _slg_entry("guardrail_intervened", _bedrock_block_response())
-        span = self._emit_and_get_guardrail_span(entry)
-        self.assertEqual(
-            _attr(span, "guardrail_action"),
-            "GUARDRAIL_INTERVENED",
-        )
-
-    def test_no_violation_categories_when_status_is_success(self):
-        """Don't pollute traces with an empty categories attribute when the
-        guardrail allowed the request through — only emit on intervened."""
+    def test_no_violation_categories_when_field_absent(self):
+        """When the provider didn't populate violation_categories (success
+        path, or provider didn't extract them), don't pollute the trace
+        with an empty attribute."""
         entry = _slg_entry("success", {"action": "NONE", "assessments": []})
+        span = self._emit_and_get_guardrail_span(entry)
+        self.assertIsNone(_attr(span, "guardrail_violation_categories"))
+
+    def test_no_violation_categories_when_field_is_empty(self):
+        """Empty list must not produce a span attribute either."""
+        entry = _slg_entry(
+            "guardrail_intervened",
+            _bedrock_block_response(),
+            violation_categories=[],
+        )
         span = self._emit_and_get_guardrail_span(entry)
         self.assertIsNone(_attr(span, "guardrail_violation_categories"))
 
@@ -412,10 +503,15 @@ class TestCustomGuardrailEndToEnd(unittest.TestCase):
     the guardrail span carries the recorded information."""
 
     def test_real_custom_guardrail_violation_path(self):
-        from fastapi import HTTPException
-
+        # Deliberately not importing fastapi here — the real Bedrock guardrail
+        # raises HTTPException, but the OTEL span flow is exception-type
+        # agnostic. Using a plain Exception keeps this test runnable in
+        # SDK-only installs that don't ship fastapi.
         from litellm.integrations.custom_guardrail import CustomGuardrail
         from litellm.types.guardrails import GuardrailEventHooks
+
+        class BlockingViolation(Exception):
+            pass
 
         class BlockingGuardrail(CustomGuardrail):
             async def async_pre_call_hook(
@@ -435,8 +531,11 @@ class TestCustomGuardrailEndToEnd(unittest.TestCase):
                     end_time=start_ts + 0.01,
                     duration=0.01,
                     event_type=GuardrailEventHooks.pre_call,
+                    tracing_detail={
+                        "violation_categories": ["Fiduciary Advice", "VIOLENCE"]
+                    },
                 )
-                raise HTTPException(status_code=400, detail="violation")
+                raise BlockingViolation("violation")
 
         request_data = {
             "model": "gpt-4",
@@ -448,10 +547,8 @@ class TestCustomGuardrailEndToEnd(unittest.TestCase):
             event_hook=GuardrailEventHooks.pre_call,
         )
 
-        import asyncio
-
-        with self.assertRaises(HTTPException):
-            asyncio.new_event_loop().run_until_complete(
+        with self.assertRaises(BlockingViolation):
+            _run(
                 guardrail.async_pre_call_hook(
                     user_api_key_dict=UserAPIKeyAuth(api_key="sk-test"),
                     cache=None,
@@ -490,6 +587,12 @@ class TestCustomGuardrailEndToEnd(unittest.TestCase):
             _attr(guardrail_spans[0], "guardrail_name"),
             "blocking-test",
         )
+        # End-to-end: the violation_categories the guardrail passed through
+        # tracing_detail must arrive as a queryable span attribute.
+        categories = _attr(guardrail_spans[0], "guardrail_violation_categories")
+        self.assertIsNotNone(categories)
+        self.assertIn("Fiduciary Advice", str(categories))
+        self.assertIn("VIOLENCE", str(categories))
 
 
 if __name__ == "__main__":

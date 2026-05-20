@@ -63,6 +63,7 @@ from litellm.types.utils import (
     CallTypesLiteral,
     Choices,
     GuardrailStatus,
+    GuardrailTracingDetail,
     Message,
     ModelResponse,
     ModelResponseStream,
@@ -509,6 +510,14 @@ class BedrockGuardrail(CustomGuardrail, BaseAWSLLM):
         # Add guardrail information to request trace
         #########################################################
         _json_response = httpx_response.json()
+        # Build the tracing detail before redaction so downstream loggers
+        # (OTEL, Langfuse, ...) get the actual category names rather than
+        # the "[REDACTED]" sentinel that replaces customWords.match later.
+        violation_categories = self._extract_violation_category_names(_json_response)
+        tracing_detail: GuardrailTracingDetail = {}
+        if violation_categories:
+            tracing_detail["violation_categories"] = violation_categories
+
         # Raw Bedrock JSON is passed here; match/regex redaction runs once inside
         # CustomGuardrail.add_standard_logging_guardrail_information_to_request_data.
         self.add_standard_logging_guardrail_information_to_request_data(
@@ -522,6 +531,7 @@ class BedrockGuardrail(CustomGuardrail, BaseAWSLLM):
             end_time=datetime.now().timestamp(),
             duration=(datetime.now() - start_time).total_seconds(),
             event_type=event_type,
+            tracing_detail=tracing_detail or None,
         )
         #########################################################
         if httpx_response.status_code == 200:
@@ -639,6 +649,31 @@ class BedrockGuardrail(CustomGuardrail, BaseAWSLLM):
             if isinstance(err, str):
                 return (status_code, err)
         return (status_code, message)
+
+    def _extract_violation_category_names(
+        self, response: BedrockGuardrailResponse
+    ) -> List[str]:
+        """
+        Flatten the BLOCKED assessments into a list of human-readable category
+        names suitable for queryable OTEL / standard-logging attributes.
+
+        Reads from the same raw response shape as `_extract_blocked_assessments`
+        but returns only the label that identifies *what* was violated
+        (topic name, content filter type, PII entity type, ...). Called
+        before `add_standard_logging_guardrail_information_to_request_data`
+        so the names are taken from the unredacted JSON — afterwards the
+        customWords/regex `match` fields get scrubbed to "[REDACTED]".
+        """
+        names: List[str] = []
+        for block in self._extract_blocked_assessments(response):
+            for match in block.get("matches", []) or []:
+                # Topics/regexes label themselves via `name`; filters/PII via
+                # `type`; customWords are identified by `match` (only safe to
+                # read pre-redaction, which is why this runs here).
+                label = match.get("name") or match.get("type") or match.get("match")
+                if isinstance(label, str) and label:
+                    names.append(label)
+        return names
 
     def _extract_blocked_assessments(
         self, response: BedrockGuardrailResponse

@@ -2073,6 +2073,66 @@ def test_get_http_exception_includes_assessments_and_identifier():
     assert exc.detail["assessments"][0]["matches"][0]["match"] == "[REDACTED]"
 
 
+def test_extract_violation_category_names_mixed_policies():
+    """Topic names, content-filter types, PII types, custom-word matches, and
+    managed-word types all flatten into a single category-name list."""
+    g = _make_guardrail()
+    response = {
+        "action": "GUARDRAIL_INTERVENED",
+        "assessments": [
+            {
+                "topicPolicy": {
+                    "topics": [
+                        {"name": "Fiduciary Advice", "action": "BLOCKED"},
+                        {"name": "Tax Advice", "action": "BLOCKED"},
+                    ]
+                },
+                "contentPolicy": {
+                    "filters": [{"type": "VIOLENCE", "action": "BLOCKED"}]
+                },
+                "wordPolicy": {
+                    "customWords": [{"match": "secret-codeword", "action": "BLOCKED"}],
+                    "managedWordLists": [{"type": "PROFANITY", "action": "BLOCKED"}],
+                },
+                "sensitiveInformationPolicy": {
+                    "piiEntities": [{"type": "EMAIL", "action": "BLOCKED"}]
+                },
+            }
+        ],
+    }
+    names = g._extract_violation_category_names(response)
+    assert "Fiduciary Advice" in names
+    assert "Tax Advice" in names
+    assert "VIOLENCE" in names
+    assert "PROFANITY" in names
+    assert "EMAIL" in names
+    assert "secret-codeword" in names
+
+
+def test_extract_violation_category_names_skips_anonymized():
+    """ANONYMIZED entries are not blocks — they must not contribute to the
+    violation_categories list."""
+    g = _make_guardrail()
+    response = {
+        "action": "GUARDRAIL_INTERVENED",
+        "assessments": [
+            {
+                "sensitiveInformationPolicy": {
+                    "piiEntities": [{"type": "NAME", "action": "ANONYMIZED"}]
+                }
+            }
+        ],
+    }
+    assert g._extract_violation_category_names(response) == []
+
+
+def test_extract_violation_category_names_no_assessments():
+    """Empty / missing assessments → empty list, not an error."""
+    g = _make_guardrail()
+    assert g._extract_violation_category_names({"action": "NONE"}) == []
+    assert g._extract_violation_category_names({"assessments": None}) == []
+
+
 def test_get_http_exception_no_blocked_assessments_omits_field():
     """L3: when no assessments are blocked, the `assessments` key is omitted entirely."""
     g = _make_guardrail()
