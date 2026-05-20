@@ -2074,8 +2074,9 @@ def test_get_http_exception_includes_assessments_and_identifier():
 
 
 def test_extract_violation_category_names_mixed_policies():
-    """Topic names, content-filter types, PII types, custom-word matches, and
-    managed-word types all flatten into a single category-name list."""
+    """Topic names, content-filter types, PII types, and managed-word types
+    flatten into a single category-name list — using only the operator-
+    defined `name`/`type` labels."""
     g = _make_guardrail()
     response = {
         "action": "GUARDRAIL_INTERVENED",
@@ -2091,7 +2092,6 @@ def test_extract_violation_category_names_mixed_policies():
                     "filters": [{"type": "VIOLENCE", "action": "BLOCKED"}]
                 },
                 "wordPolicy": {
-                    "customWords": [{"match": "secret-codeword", "action": "BLOCKED"}],
                     "managedWordLists": [{"type": "PROFANITY", "action": "BLOCKED"}],
                 },
                 "sensitiveInformationPolicy": {
@@ -2106,7 +2106,58 @@ def test_extract_violation_category_names_mixed_policies():
     assert "VIOLENCE" in names
     assert "PROFANITY" in names
     assert "EMAIL" in names
-    assert "secret-codeword" in names
+
+
+def test_extract_violation_category_names_does_not_leak_user_input():
+    """SECURITY: customWords.match is the raw user-submitted word that
+    triggered the rule, and an unnamed regex match is the actual sensitive
+    value (e.g. a credit-card number). Neither must appear in
+    violation_categories — otherwise the content the guardrail blocked
+    leaks straight into telemetry backends."""
+    g = _make_guardrail()
+    response = {
+        "action": "GUARDRAIL_INTERVENED",
+        "assessments": [
+            {
+                "wordPolicy": {
+                    "customWords": [
+                        {"match": "secret-codeword-abc-123", "action": "BLOCKED"}
+                    ],
+                },
+                "sensitiveInformationPolicy": {
+                    "regexes": [{"match": "4111-1111-1111-1111", "action": "BLOCKED"}]
+                },
+            }
+        ],
+    }
+    names = g._extract_violation_category_names(response)
+    assert "secret-codeword-abc-123" not in names
+    assert "4111-1111-1111-1111" not in names
+    assert names == []
+
+
+def test_extract_violation_category_names_named_regex_uses_name():
+    """A regex with a `name` field surfaces that operator-defined label
+    (safe to log), not the matched value."""
+    g = _make_guardrail()
+    response = {
+        "action": "GUARDRAIL_INTERVENED",
+        "assessments": [
+            {
+                "sensitiveInformationPolicy": {
+                    "regexes": [
+                        {
+                            "name": "credit-card-pattern",
+                            "match": "4111-1111-1111-1111",
+                            "action": "BLOCKED",
+                        }
+                    ]
+                }
+            }
+        ],
+    }
+    names = g._extract_violation_category_names(response)
+    assert names == ["credit-card-pattern"]
 
 
 def test_extract_violation_category_names_skips_anonymized():

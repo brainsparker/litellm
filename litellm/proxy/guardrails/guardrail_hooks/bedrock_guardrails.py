@@ -657,20 +657,23 @@ class BedrockGuardrail(CustomGuardrail, BaseAWSLLM):
         Flatten the BLOCKED assessments into a list of human-readable category
         names suitable for queryable OTEL / standard-logging attributes.
 
-        Reads from the same raw response shape as `_extract_blocked_assessments`
-        but returns only the label that identifies *what* was violated
-        (topic name, content filter type, PII entity type, ...). Called
-        before `add_standard_logging_guardrail_information_to_request_data`
-        so the names are taken from the unredacted JSON — afterwards the
-        customWords/regex `match` fields get scrubbed to "[REDACTED]".
+        SECURITY: only emits the non-sensitive policy *label* (topic name,
+        content-filter type, PII entity type, named-regex name). The raw
+        ``match`` field is intentionally NOT used — it carries the user's
+        original input that triggered the rule (e.g. a credit-card number
+        that hit a regex, or the literal custom word). Surfacing it to
+        telemetry would re-introduce the sensitive content the guardrail
+        was supposed to keep out. Entries that only have a ``match`` (bare
+        customWords, unnamed regexes) are therefore skipped — operators
+        can still see the count in ``_extract_blocked_assessments`` which
+        feeds the HTTP error detail.
         """
         names: List[str] = []
         for block in self._extract_blocked_assessments(response):
             for match in block.get("matches", []) or []:
-                # Topics/regexes label themselves via `name`; filters/PII via
-                # `type`; customWords are identified by `match` (only safe to
-                # read pre-redaction, which is why this runs here).
-                label = match.get("name") or match.get("type") or match.get("match")
+                # Allow-list non-sensitive labels only. Never fall back to
+                # `match.get("match")` — that's user-submitted content.
+                label = match.get("name") or match.get("type")
                 if isinstance(label, str) and label:
                     names.append(label)
         return names
