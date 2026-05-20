@@ -726,8 +726,56 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
             exception_logging_span.set_status(Status(StatusCode.ERROR))
             exception_logging_span.end(end_time=self._to_ns(datetime.now()))
 
+            # Emit guardrail spans for any guardrail invocations that
+            # ran during this request. _handle_failure typically does this,
+            # but for pre-call guardrail blocks the standard_logging_object
+            # may not carry guardrail_information by the time _handle_failure
+            # fires (the data lives only in request_data["metadata"]). Pull
+            # directly from request_data so the span is recorded either way;
+            # _emit_once dedupes if _handle_failure already emitted it.
+            self._emit_guardrail_spans_from_request_data(
+                request_data=request_data,
+                parent_span=parent_otel_span,
+            )
+
             # End Parent OTEL Sspan
             parent_otel_span.end(end_time=self._to_ns(datetime.now()))
+
+    def _emit_guardrail_spans_from_request_data(
+        self,
+        request_data: dict,
+        parent_span: Optional[Any],
+    ) -> None:
+        """Emit ``guardrail`` spans from ``request_data["metadata"]
+        ["standard_logging_guardrail_information"]``.
+
+        Routed through ``_create_guardrail_span`` so the dedupe state in
+        ``_otel_internal`` is honoured — if ``_handle_failure`` already
+        emitted these spans for the same kwargs, this is a no-op.
+        """
+        from opentelemetry import trace as _trace
+
+        metadata = (request_data or {}).get("metadata") or {}
+        guardrail_information = metadata.get("standard_logging_guardrail_information")
+        if not guardrail_information:
+            return
+
+        # _create_guardrail_span reads guardrail_information from
+        # kwargs["standard_logging_object"] and shares its dedupe state via
+        # kwargs["litellm_params"]["metadata"]["_otel_internal"]. Pass the
+        # SAME metadata dict the proxy populated so _handle_failure and
+        # this hook see the same dedupe markers.
+        kwargs: Dict[str, Any] = {
+            "litellm_params": {"metadata": metadata},
+            "standard_logging_object": {
+                "guardrail_information": guardrail_information,
+                "metadata": metadata,
+            },
+        }
+        context = (
+            _trace.set_span_in_context(parent_span) if parent_span is not None else None
+        )
+        self._create_guardrail_span(kwargs=kwargs, context=context)
 
     async def async_post_call_success_hook(
         self,
@@ -1617,9 +1665,131 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
                 value=guardrail_information.get("guardrail_response"),
             )
 
+            # Surface guardrail_status (success / guardrail_intervened /
+            # guardrail_failed_to_respond / not_run) as a top-level span
+            # attribute so trace backends can filter on it without parsing
+            # guardrail_response.
+            self.safe_set_attribute(
+                span=guardrail_span,
+                key="guardrail_status",
+                value=guardrail_information.get("guardrail_status"),
+            )
+
+            # When the guardrail intervened, lift the violation summary
+            # (top-level provider action + blocked-category names) onto
+            # the span as queryable attributes. Without this, the only
+            # record of *what* was violated is buried inside the
+            # guardrail_response blob and cannot be aggregated on.
+            if guardrail_information.get("guardrail_status") == "guardrail_intervened":
+                self._set_guardrail_violation_attributes(
+                    span=guardrail_span,
+                    guardrail_response=guardrail_information.get("guardrail_response"),
+                )
+
             self._set_team_attributes_from_kwargs(guardrail_span, kwargs)
 
             guardrail_span.end(end_time=self._to_ns(end_time_datetime))
+
+    def _set_guardrail_violation_attributes(
+        self, span: Any, guardrail_response: Any
+    ) -> None:
+        """Extract the provider action and blocked-category labels from a
+        guardrail response and stamp them on the span.
+
+        Currently understands the Bedrock ApplyGuardrail shape (top-level
+        ``action`` + ``assessments[*]`` with topicPolicy / contentPolicy /
+        wordPolicy / sensitiveInformationPolicy / contextualGroundingPolicy).
+        For other providers the response is typically a string, so no
+        attributes are added — the ``guardrail_status`` / ``guardrail_response``
+        attributes already carry the salient information.
+        """
+        if not isinstance(guardrail_response, dict):
+            return
+
+        action = guardrail_response.get("action")
+        if isinstance(action, str) and action:
+            self.safe_set_attribute(span=span, key="guardrail_action", value=action)
+
+        categories = self._extract_bedrock_violation_categories(guardrail_response)
+        if categories:
+            # OTel sequence attributes must be homogeneous primitives;
+            # serialise once so set_attribute never has to coerce mixed types.
+            span.set_attribute("guardrail_violation_categories", safe_dumps(categories))
+
+    @staticmethod
+    def _extract_bedrock_violation_categories(
+        guardrail_response: Dict[str, Any],
+    ) -> List[str]:
+        """Walk the Bedrock ``assessments`` array and return the names of
+        every policy item whose ``action`` indicates intervention (BLOCKED
+        / ANONYMIZED — both are "the guardrail did something"). Duplicates
+        are preserved so a backend can see how many distinct rules fired.
+        """
+        assessments = guardrail_response.get("assessments")
+        if not isinstance(assessments, list):
+            return []
+
+        intervened_actions = {"BLOCKED", "ANONYMIZED"}
+        categories: List[str] = []
+
+        def _add(value: Any) -> None:
+            if isinstance(value, str) and value:
+                categories.append(value)
+
+        for assessment in assessments:
+            if not isinstance(assessment, dict):
+                continue
+
+            topic_policy = assessment.get("topicPolicy") or {}
+            for topic in topic_policy.get("topics") or []:
+                if (
+                    isinstance(topic, dict)
+                    and topic.get("action") in intervened_actions
+                ):
+                    _add(topic.get("name"))
+
+            content_policy = assessment.get("contentPolicy") or {}
+            for filter_item in content_policy.get("filters") or []:
+                if (
+                    isinstance(filter_item, dict)
+                    and filter_item.get("action") in intervened_actions
+                ):
+                    _add(filter_item.get("type"))
+
+            word_policy = assessment.get("wordPolicy") or {}
+            for custom in word_policy.get("customWords") or []:
+                if (
+                    isinstance(custom, dict)
+                    and custom.get("action") in intervened_actions
+                ):
+                    _add(custom.get("match"))
+            for managed in word_policy.get("managedWordLists") or []:
+                if (
+                    isinstance(managed, dict)
+                    and managed.get("action") in intervened_actions
+                ):
+                    _add(managed.get("type") or managed.get("match"))
+
+            sensitive_policy = assessment.get("sensitiveInformationPolicy") or {}
+            for pii in sensitive_policy.get("piiEntities") or []:
+                if isinstance(pii, dict) and pii.get("action") in intervened_actions:
+                    _add(pii.get("type"))
+            for regex in sensitive_policy.get("regexes") or []:
+                if (
+                    isinstance(regex, dict)
+                    and regex.get("action") in intervened_actions
+                ):
+                    _add(regex.get("name"))
+
+            grounding_policy = assessment.get("contextualGroundingPolicy") or {}
+            for grounding in grounding_policy.get("filters") or []:
+                if (
+                    isinstance(grounding, dict)
+                    and grounding.get("action") in intervened_actions
+                ):
+                    _add(grounding.get("type"))
+
+        return categories
 
     def _handle_failure(self, kwargs, response_obj, start_time, end_time):
         from opentelemetry.trace import Status, StatusCode
